@@ -120,7 +120,7 @@ def export_torchscript(model, im, file, optimize, prefix=colorstr('TorchScript:'
     f = file.with_suffix('.torchscript')
 
     ts = torch.jit.trace(model, im, strict=False)
-    d = {'shape': im.shape, 'stride': int(max(model.stride)), 'names': model.names}
+    d = {'shape': im.shape, 'stride': int(max(model.stride)), 'names': model.base_model.base_model.names}
     extra_files = {'config.txt': json.dumps(d)}  # torch._C.ExtraFilesMap()
     if optimize:  # https://pytorch.org/tutorials/recipes/mobile_interpreter.html
         optimize_for_mobile(ts)._save_for_lite_interpreter(str(f), _extra_files=extra_files)
@@ -163,7 +163,7 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
     onnx.checker.check_model(model_onnx)  # check onnx model
 
     # Metadata
-    d = {'stride': int(max(model.stride)), 'names': model.names}
+    d = {'stride': int(max(model.base_model.base_model.stride)), 'names': model.base_model.base_model.names}
     for k, v in d.items():
         meta = model_onnx.metadata_props.add()
         meta.key, meta.value = k, str(v)
@@ -232,7 +232,8 @@ def export_coreml(model, im, file, int8, half, prefix=colorstr('CoreML:')):
     f = file.with_suffix('.mlmodel')
 
     ts = torch.jit.trace(model, im, strict=False)  # TorchScript model
-    ct_model = ct.convert(ts, inputs=[ct.ImageType('image', shape=im.shape, scale=1 / 255, bias=[0, 0, 0])])
+    # ct_model = ct.convert(ts, inputs=[ct.ImageType('image', shape=im.shape, scale=1 / 255, bias=[0, 0, 0])])
+    ct_model = ct.convert(ts, inputs=[ct.TensorType(shape=im.shape)])
     bits, mode = (8, 'kmeans_lut') if int8 else (16, 'linear') if half else (32, None)
     if bits < 32:
         if MACOS:  # quantization only supported on macOS
@@ -506,6 +507,41 @@ def add_tflite_metadata(file, metadata, num_outputs):
         tmp_file.unlink()
 
 
+class TensorLayoutWrapper(torch.nn.Module):
+
+    def __init__(self, base_model):
+        super(TensorLayoutWrapper, self).__init__()
+
+        self.base_model = base_model
+
+        self.eval()
+
+
+    def forward(self, x):
+        x = x.permute(0, 3, 1, 2)
+
+        return self.base_model(x)
+
+class NormalizationWrapper(torch.nn.Module):
+
+    def __init__(self, base_model, mean, scale):
+        super(NormalizationWrapper, self).__init__()
+
+        self.base_model = base_model
+
+        self.scale = torch.tensor(scale).view(1, 3, 1, 1)
+        self.mean = torch.tensor(mean).view(1, 3, 1, 1) * self.scale
+
+        self.eval()
+
+
+    def forward(self, x):
+        x = x.float()
+        x = (x - self.mean) / self.scale
+
+        return self.base_model(x)
+
+
 @smart_inference_mode()
 def run(
         data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
@@ -554,7 +590,10 @@ def run(
     # Input
     gs = int(max(model.stride))  # grid size (max stride)
     imgsz = [check_img_size(x, gs) for x in imgsz]  # verify img_size are gs-multiples
-    im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
+
+    # PRC input compatibility
+    # im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
+    im = torch.zeros(batch_size, *imgsz, 3).to(device).type(torch.uint8)  # image size(1,320,192,3) BHWC iDetection
 
     # Update model
     model.eval()
@@ -564,12 +603,17 @@ def run(
             m.dynamic = dynamic
             m.export = True
 
+    # PRC compatibility wrapper
+    model = NormalizationWrapper(model, (0.0, 0.0, 0.0), (255.0, 255.0, 255.0))
+    model = TensorLayoutWrapper(model)            
+
     for _ in range(2):
         y = model(im)  # dry runs
     if half and not coreml:
-        im, model = im.half(), model.half()  # to FP16
+        im, model.base_model.base_model = im.half(), model.base_model.base_model.half()  # to FP16
+
     shape = tuple((y[0] if isinstance(y, tuple) else y).shape)  # model output shape
-    metadata = {'stride': int(max(model.stride)), 'names': model.names}  # model metadata
+    metadata = {'stride': int(max(model.base_model.base_model.stride)), 'names': model.base_model.base_model.names}  # model metadata
     LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)")
 
     # Exports
